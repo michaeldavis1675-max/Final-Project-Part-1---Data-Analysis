@@ -1,0 +1,507 @@
+---
+title: "Crime Data Raw Numbers Analysis"
+author: "Michael Davis"
+date: "2026-05-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+```
+
+```{r global setup}
+#=========================================================
+#0. GLOBAL SETUP
+#=========================================================
+cat("Loading libraries...\n")
+
+library(readr)
+library(readxl)
+library(dplyr)
+library(purrr)
+library(tibble)
+library(stringr)
+library(glue)
+library(tidyr)
+library(rlang)
+library(vroom)
+library(ggplot2)
+library(scales)
+
+cat("Libraries loaded\n")
+
+# ---------------------------------------------------------
+# CONFIGURATION
+# ---------------------------------------------------------
+
+input_root <- "F:/Dad's Stuff/_Data Analytics Course/Census Project/State Crime Data 2024"
+output_root <- input_root
+
+recursive_scan <- TRUE
+min_rows_to_accept <- 1
+
+cat("Config loaded\n")
+
+# ---------------------------------------------------------
+# STATE FOLDERS (SINGLE SOURCE OF TRUTH)
+# ---------------------------------------------------------
+
+state_folders <- list.dirs(input_root, recursive = FALSE, full.names = TRUE)
+state_folders <- state_folders[!str_detect(state_folders, regex("_archive", ignore_case = TRUE))]
+
+cat("State folders identified:", length(state_folders), "\n")
+cat("Block 0 (global setup) completed. \n")
+
+```
+
+```{r QA_QC pipeline}
+#=========================================================
+#1. QA/QC PIPELINE (STRUCTURE VALIDATION)
+#=========================================================
+cat("Running QA/QC ingestion validation...\n")
+
+recursive_scan <- TRUE
+
+get_files <- function(folder) {
+  list.files(folder,
+             pattern = "\\.(csv|xlsx|xls)$",
+             full.names = TRUE,
+             recursive = recursive_scan,
+             ignore.case = TRUE)
+}
+
+ingestion_log <- list()
+
+safe_read_csv <- function(path) {
+  tryCatch(
+    read_csv(path, show_col_types = FALSE, progress = FALSE),
+    error = function(e) {
+      ingestion_log[[length(ingestion_log)+1]] <<- tibble(file = path, error = e$message)
+      NULL
+    }
+  )
+}
+
+safe_read_excel <- function(path) {
+  tryCatch(
+    read_excel(path),
+    error = function(e) {
+      ingestion_log[[length(ingestion_log)+1]] <<- tibble(file = path, error = e$message)
+      NULL
+    }
+  )
+}
+
+process_folder <- function(folder_path) {
+
+  files <- get_files(folder_path)
+
+  tibble(
+    folder = basename(folder_path),
+    total_files = length(files)
+  )
+}
+
+state_results <- map_dfr(state_folders, process_folder)
+
+state_results
+
+cat("Block 1 (QA/QC Pipeline) completed. \n")
+
+```
+
+```{r EDA quality engine}
+#=========================================================
+#2. EDA + QUALITY ENGINE
+#=========================================================
+cat("Running EDA + profiling engine...\n")
+
+summary_results <- list()
+
+for (folder in state_folders) {
+
+  files <- get_files(folder)
+
+  for (file in files) {
+
+    df <- tryCatch(
+      vroom(file, show_col_types = FALSE, progress = FALSE),
+      error = function(e) NULL
+    )
+
+    summary_results[[length(summary_results)+1]] <- tibble(
+      file = basename(file),
+      folder = basename(folder),
+      rows = ifelse(is.null(df), 0, nrow(df)),
+      cols = ifelse(is.null(df), 0, ncol(df))
+    )
+  }
+}
+
+flat_results <- bind_rows(summary_results)
+
+flat_results <- flat_results %>%
+  mutate(
+    quality_score = pmax(0, 100 - (rows * 0.01 + cols * 0.5))
+  )
+
+print(flat_results, n = Inf)
+
+cat("Block 2 (EDA + Quality Engine) completed. \n")
+
+```
+
+```{r}
+# =========================================================
+# 3. BUILD FLAT RESULTS + FINAL DATASET (CORE INGESTION)
+# =========================================================
+
+cat("Building flat_results and final_dataset...\n")
+
+summary_results <- list()
+data_results <- list()
+
+for (folder in state_folders) {
+
+  files <- get_files(folder)
+
+  for (file in files) {
+
+    df <- tryCatch(
+      vroom(file, show_col_types = FALSE, progress = FALSE),
+      error = function(e) NULL
+    )
+
+    # -----------------------------------------------------
+    # SAFE FILE-LEVEL METADATA (flat_results source)
+    # -----------------------------------------------------
+    summary_results[[length(summary_results) + 1]] <- tibble(
+      file = basename(file),
+      folder = basename(folder),
+      rows = ifelse(is.null(df), 0, nrow(df)),
+      cols = ifelse(is.null(df), 0, ncol(df))
+    )
+
+    # -----------------------------------------------------
+    # SAFE DATA EXTRACTION (final_dataset source)
+    # -----------------------------------------------------
+    if (!is.null(df)) {
+
+      names(df) <- tolower(names(df))
+
+      # keep only records that contain required fields
+      if (all(c("violent_count", "property_count") %in% names(df))) {
+
+        df_clean <- df %>%
+          mutate(
+            violent_count = as.numeric(violent_count),
+            property_count = as.numeric(property_count)
+          ) %>%
+          select(
+            any_of(c(
+              "violent_count",
+              "property_count",
+              "state",
+              "county",
+              "agency_id",
+              "incident_id",
+              "data_year"
+            ))
+          )
+
+        data_results[[length(data_results) + 1]] <- df_clean
+      }
+    }
+  }
+}
+
+# =========================================================
+# BUILD OUTPUT OBJECTS
+# =========================================================
+
+flat_results <- bind_rows(summary_results)
+
+final_dataset <- bind_rows(data_results)
+
+cat("\nflat_results rows:", nrow(flat_results), "\n")
+cat("final_dataset rows:", nrow(final_dataset), "\n")
+cat("final_dataset columns:", ncol(final_dataset), "\n")
+
+cat("Data build complete.\n")
+
+```
+
+
+```{r}
+
+#=========================================================
+#3a. Data validation
+#=========================================================
+cat("\n===== DATA VALIDATION CHECK =====\n")
+
+cat("Rows in final_dataset:", nrow(final_dataset), "\n")
+cat("Columns:", ncol(final_dataset), "\n")
+
+cat("\nSummary stats:\n")
+print(summary(final_dataset[, c("violent_count", "property_count")]))
+
+cat("\nTotal violent incidents:", sum(final_dataset$violent_count, na.rm = TRUE), "\n")
+cat("Total property incidents:", sum(final_dataset$property_count, na.rm = TRUE), "\n")
+
+```
+
+# Statistical analysis
+A two-sample t-test is often used in exploratory analysis to assess whether two measures (raw counts of property crime and violent crime) are correlated (though this says nothing about causation). In this context, it's an initial statistical lens for comparing aggregated crime measures before moving into wider analysis at the region and/or county level.
+
+```{r}
+
+# =========================================================
+# TWO-SAMPLE T-TEST (HIGH vs LOW PROPERTY CRIME COUNTIES)
+# =========================================================
+
+cat("Running two-sample t-test...\n")
+
+# Create grouping variable (median split)
+final_dataset <- final_dataset %>%
+  mutate(
+    property_group = ifelse(
+      property_count >= median(property_count, na.rm = TRUE),
+      "High Property Crime",
+      "Low Property Crime"
+    )
+  )
+
+# Run t-test on violent crime between groups
+t_test_result <- t.test(
+  violent_count ~ property_group,
+  data = final_dataset
+)
+
+t_test_result
+
+```
+# Results of two-sample t-test
+Given that the confidence interval is 95 percent, and the p-value is far below the conventional 0.05 significance threshold, the null hypothesis (no relationship between property crime and violent crime) is rejected. While this does not imply causation, it does indicate a statistically strong and highly reliable association in the dataset, meaning the relationship between the two variables is empirically undeniable at the county aggregation level.
+
+
+```{r data visualization}
+# =========================================================
+# 5. DATA VISUALIZATION
+# =========================================================
+
+cat("Generating summary statistics visualization color palette...\n")
+
+# ---------------------------------------------------------
+# COLOR PALETTE (GLOBAL CONSISTENCY)
+# ---------------------------------------------------------
+
+crime_colors <- c(
+  "Property Crime" = "steelblue",
+  "Violent Crime" = "salmon"
+)
+
+cat("Color palette generated. \n")
+
+```
+
+```{r grouped_bar_chart, fig.width=11, fig.height=7}
+# ---------------------------------------------------------
+# MEAN VS MEDIAN COMPARISON
+# ---------------------------------------------------------
+
+summary_stats <- tibble(
+  measure = c("Mean", "Median"),
+
+  property_crime = c(
+    mean(final_dataset$property_count, na.rm = TRUE),
+    median(final_dataset$property_count, na.rm = TRUE)
+  ),
+
+  violent_crime = c(
+    mean(final_dataset$violent_count, na.rm = TRUE),
+    median(final_dataset$violent_count, na.rm = TRUE)
+  )
+)
+
+summary_long <- summary_stats %>%
+  pivot_longer(
+    cols = c(property_crime, violent_crime),
+    names_to = "crime_type",
+    values_to = "count"
+  ) %>%
+  mutate(
+    crime_type = recode(
+      crime_type,
+      property_crime = "Property Crime",
+      violent_crime = "Violent Crime"
+    )
+  )
+
+ggplot(summary_long, aes(x = measure, y = count, fill = crime_type)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = crime_colors) +
+  labs(
+    title = "Mean vs Median Crime Counts",
+    x = "Statistic",
+    y = "Crime Count",
+    fill = "Crime Type"
+  ) +
+  theme_minimal(base_size = 14)
+
+cat("Plot 1 of 4 (Mean/Median) complete\n")
+
+```
+
+```{r log_boxplot_crime, fig.width=14, fig.height=9}
+# ---------------------------------------------------------
+# LOG-SCALE BOXPLOT (STABLE TRANSFORM)
+# ---------------------------------------------------------
+
+plot_df <- final_dataset %>%
+  select(violent_count, property_count) %>%
+  mutate(
+    violent_count = pmax(violent_count, 0),
+    property_count = pmax(property_count, 0)
+  ) %>%
+  pivot_longer(
+    cols = c(violent_count, property_count),
+    names_to = "crime_type",
+    values_to = "count"
+  ) %>%
+  mutate(
+    crime_type = recode(
+      crime_type,
+      violent_count = "Violent Crime",
+      property_count = "Property Crime"
+    )
+  )
+
+ggplot(plot_df, aes(x = crime_type, y = count, fill = crime_type)) +
+  geom_boxplot(outlier.alpha = 0.25, width = 0.6) +
+  scale_y_continuous(
+    trans = "log1p",
+    labels = scales::comma_format()
+  ) +
+  scale_fill_manual(values = crime_colors) +
+  labs(
+    title = "Distribution of Crime Counts by Type",
+    subtitle = "Log1p transformation reduces skew from extreme county-level variation",
+    x = "Crime Type",
+    y = "Incident Count (log1p scale)"
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(face = "bold")
+  )
+```
+
+
+```{r log_log_regression, fig.width=14, fig.height=9}
+# ---------------------------------------------------------
+# LOG-LOG REGRESSION (CONSISTENT TRANSFORM)
+# ---------------------------------------------------------
+
+final_dataset <- final_dataset %>%
+  mutate(
+    violent_log = log1p(violent_count),
+    property_log = log1p(property_count)
+  )
+
+model_log <- lm(violent_log ~ property_log, data = final_dataset)
+
+ggplot(final_dataset, aes(x = property_log, y = violent_log)) +
+  geom_point(
+    alpha = 0.35,
+    size = 1.8,
+    color = "steelblue"
+  ) +
+  geom_smooth(
+    method = "lm",
+    color = "darkgreen",
+    se = TRUE,
+    linewidth = 1.2
+  ) +
+  labs(
+    title = "Log-Log Relationship: Property vs Violent Crime",
+    subtitle = "County-level aggregation (log1p transformation applied to reduce skew)",
+    x = "Number of Property Crime incidents (Log1p scale)",
+    y = "Number of Violent Crime incidents (Log1p scale)"
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+cat("Plot 3 of 4 (Regression) complete\n")
+
+```
+
+```{r combined_histogram, fig.width=14, fig.height=9}
+# ---------------------------------------------------------
+# LOG DISTRIBUTION HISTOGRAM (NA SAFE)
+# ---------------------------------------------------------
+
+hist_df <- tibble(
+  property_log = log1p(final_dataset$property_count),
+  violent_log = log1p(final_dataset$violent_count)
+) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "crime_type",
+    values_to = "log_count"
+  ) %>%
+  mutate(
+    crime_type = recode(
+      crime_type,
+      property_log = "Property Crime",
+      violent_log = "Violent Crime"
+    )
+  )
+
+# Compute means separately (cleaner + reusable)
+mean_lines <- hist_df %>%
+  group_by(crime_type) %>%
+  summarise(
+    mean_value = mean(log_count, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(hist_df, aes(x = log_count, fill = crime_type)) +
+  geom_histogram(
+    position = "identity",
+    alpha = 0.35,
+    bins = 35,
+    color = "white",
+    linewidth = 0.2
+  ) +
+  geom_vline(
+    data = mean_lines,
+    aes(xintercept = mean_value, color = crime_type),
+    linewidth = 1.3,
+    show.legend = FALSE
+  ) +
+  scale_fill_manual(values = crime_colors) +
+  scale_color_manual(values = c(
+    "Property Crime" = "darkblue",
+    "Violent Crime" = "darkred"
+  )) +
+  labs(
+    title = "Distribution of Log Crime Counts",
+    subtitle = "County-level distributions (log1p transformation applied to reduce skew)",
+    x = "Count of Crime Incidents (Log1p scale)",
+    y = "Frequency",
+    fill = "Crime Type"
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+cat("Plot 4 of 4 (Histogram) complete\n")
+cat("All visualizations finished successfully\n")
+
+```
