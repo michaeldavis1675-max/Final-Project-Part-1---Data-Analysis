@@ -1,0 +1,400 @@
+---
+title: "Crime Data Analysis - Raw Numbers (final)"
+author: "Michael Davis"
+date: "2026-05-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+
+# =========================================================
+# NIBRS CRIME ANALYSIS PIPELINE (FULL INTEGRATION)
+# =========================================================
+
+# =========================================================
+# 1. SETUP
+# =========================================================
+
+cat("\n[STEP 1] Loading libraries...\n")
+
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(readr)
+library(stringr)
+library(ggplot2)
+library(scales)
+library(vroom)
+
+cat("[STEP 1 COMPLETE]\n")
+
+```
+
+```{r}
+# =========================================================
+# 2. CONFIGURATION
+# =========================================================
+
+cat("\n[STEP 2] Configuring environment...\n")
+
+base_dir <- "F:/Dad's Stuff/_Data Analytics Course/Census Project/State Crime Data 2024"
+
+state_folders <- list.dirs(base_dir, recursive = FALSE, full.names = TRUE)
+state_folders <- state_folders[!str_detect(state_folders, regex("_archive", ignore_case = TRUE))]
+
+cat("States found:", length(state_folders), "\n")
+
+# Crime classification
+violent_codes <- c("assault", "homicide", "robbery", "rape")
+property_codes <- c("burglary", "larceny/theft", "motor vehicle theft", "arson")
+
+cat("[STEP 2 COMPLETE]\n")
+
+```
+
+```{r}
+# =========================================================
+# 3. SAFE LOADER
+# =========================================================
+
+safe_read <- function(path) {
+  tryCatch(
+    vroom(path, show_col_types = FALSE, progress = FALSE),
+    error = function(e) {
+      cat("FAILED FILE:", path, "\n")
+      NULL
+    }
+  )
+}
+
+```
+
+```{r}
+# =========================================================
+# 4. INGESTION + AGGREGATION
+# =========================================================
+
+cat("\n[STEP 3] Processing state folders...\n")
+
+all_states <- list()
+
+for (folder in state_folders) {
+
+  state_name <- basename(folder)
+  cat("\nProcessing:", state_name, "\n")
+
+  incident <- safe_read(file.path(folder, "NIBRS_incident.csv"))
+  offense <- safe_read(file.path(folder, "NIBRS_OFFENSE.csv"))
+  offense_type <- safe_read(file.path(folder, "NIBRS_OFFENSE_TYPE.csv"))
+  agencies <- safe_read(file.path(folder, "agencies.csv"))
+
+  if (any(is.null(list(incident, offense, offense_type, agencies)))) {
+    cat("SKIPPED:", state_name, "\n")
+    next
+  }
+
+  incident <- incident %>% filter(data_year == 2024)
+  offense <- offense %>% filter(data_year == 2024)
+
+  crime <- offense %>%
+    left_join(offense_type, by = "offense_code") %>%
+    mutate(
+      offense_group_lower = str_to_lower(offense_group),
+      offense_category_lower = str_to_lower(offense_category_name),
+
+      crime_category = case_when(
+        offense_group_lower %in% violent_codes |
+          offense_category_lower %in% violent_codes ~ "violent",
+
+        offense_group_lower %in% property_codes |
+          offense_category_lower %in% property_codes ~ "property",
+
+        TRUE ~ "other"
+      )
+    ) %>%
+    left_join(incident %>% select(incident_id, agency_id), by = "incident_id") %>%
+    left_join(
+      agencies %>% select(agency_id, county_name, state_name, region_desc),
+      by = "agency_id"
+    )
+
+  county_summary <- crime %>%
+    group_by(state_name, county_name, region_desc) %>%
+    summarise(
+      violent_count = sum(crime_category == "violent", na.rm = TRUE),
+      property_count = sum(crime_category == "property", na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    rename(
+      state = state_name,
+      county = county_name,
+      region = region_desc
+    )
+
+  cat("  Counties:", nrow(county_summary),
+      "| Violent:", sum(county_summary$violent_count),
+      "| Property:", sum(county_summary$property_count), "\n")
+
+  all_states[[state_name]] <- county_summary
+}
+
+cat("\n[STEP 3 COMPLETE]\n")
+
+```
+
+```{r}
+# =========================================================
+# 5. FINAL DATASET
+# =========================================================
+
+cat("\n[STEP 4] Building dataset...\n")
+
+final_dataset <- bind_rows(all_states) %>%
+  mutate(across(c(state, county, region), str_trim)) %>%
+  filter(!is.na(county), !is.na(state))
+
+cat("Rows:", nrow(final_dataset), "\n")
+cat("[STEP 4 COMPLETE]\n")
+
+```
+
+```{r}
+# =========================================================
+# 6. DATA VALIDATION
+# =========================================================
+
+cat("\n===== DATA VALIDATION CHECK =====\n")
+
+cat("Rows:", nrow(final_dataset), "\n")
+cat("Columns:", ncol(final_dataset), "\n")
+
+cat("\nSummary:\n")
+print(summary(final_dataset[, c("violent_count", "property_count")]))
+
+cat("\nTotals:\n")
+cat("Violent:", sum(final_dataset$violent_count, na.rm = TRUE), "\n")
+cat("Property:", sum(final_dataset$property_count, na.rm = TRUE), "\n")
+
+```
+
+
+# Statistical analysis
+A two-sample t-test is often used in exploratory analysis to assess whether two measures (raw counts of property crime and violent crime) are correlated (though this says nothing about causation). In this context, it's an initial statistical lens for comparing aggregated crime measures before moving into wider analysis at the region and/or county level.
+
+```{r}
+# =========================================================
+# 7. TWO-SAMPLE T-TEST (HIGH vs LOW PROPERTY COUNTIES)
+# =========================================================
+
+cat("\nRunning t-test...\n")
+
+final_dataset <- final_dataset %>%
+  mutate(
+    property_group = ifelse(
+      property_count >= median(property_count, na.rm = TRUE),
+      "High Property Crime",
+      "Low Property Crime"
+    )
+  )
+
+t_test_result <- t.test(violent_count ~ property_group, data = final_dataset)
+
+print(t_test_result)
+
+cat("\nNOTE: This test compares violent crime distributions between high/low property crime counties.\n")
+
+```
+
+# Results of two-sample t-test
+Given that the confidence interval is 95 percent, and the p-value is far below the conventional 0.05 significance threshold, the null hypothesis (no relationship between property crime and violent crime) is rejected. While this does not imply causation, it does indicate a statistically strong and highly reliable association in the dataset, meaning the relationship between the two variables is empirically undeniable at the county aggregation level.
+
+```{r}
+# =========================================================
+# 8. VISUALIZATION SETUP
+# =========================================================
+
+crime_colors <- c(
+  "Property Crime" = "steelblue",
+  "Violent Crime" = "salmon"
+)
+
+```
+
+```{r grouped_bar_chart, fig.width=11, fig.height=7}
+# =========================================================
+# 9. MEAN vs MEDIAN
+# =========================================================
+
+summary_stats <- tibble(
+  measure = c("Mean", "Median"),
+  property_crime = c(
+    mean(final_dataset$property_count, na.rm = TRUE),
+    median(final_dataset$property_count, na.rm = TRUE)
+  ),
+  violent_crime = c(
+    mean(final_dataset$violent_count, na.rm = TRUE),
+    median(final_dataset$violent_count, na.rm = TRUE)
+  )
+)
+
+summary_long <- summary_stats %>%
+  pivot_longer(-measure, names_to = "type", values_to = "count") %>%
+  mutate(type = recode(type,
+                       property_crime = "Property Crime",
+                       violent_crime = "Violent Crime"))
+
+ggplot(summary_long, aes(measure, count, fill = type)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = crime_colors) +
+  labs(title = "Mean vs Median Crime Counts") +
+  theme_minimal()
+
+cat("Plot 1 complete\n")
+
+```
+
+```{r log_boxplot_crime, fig.width=14, fig.height=9}
+# =========================================================
+# 10. LOG BOXPLOT
+# =========================================================
+
+plot_df <- final_dataset %>%
+  transmute(
+    violent = log1p(violent_count),
+    property = log1p(property_count)
+  ) %>%
+  pivot_longer(everything(), names_to = "type", values_to = "value") %>%
+  mutate(type = recode(type,
+                       violent = "Violent Crime",
+                       property = "Property Crime"))
+
+ggplot(plot_df, aes(type, value, fill = type)) +
+  geom_boxplot(alpha = 0.7) +
+  scale_fill_manual(values = crime_colors) +
+  theme_minimal() +
+  labs(title = "Crime Distribution (log1p)")
+
+cat("Plot 2 complete\n")
+
+```
+
+```{r log_log_regression, fig.width=14, fig.height=9}
+# =========================================================
+# 11. LOG-LOG REGRESSION
+# =========================================================
+
+final_dataset <- final_dataset %>%
+  mutate(
+    violent_log = log1p(violent_count),
+    property_log = log1p(property_count)
+  )
+
+model <- lm(violent_log ~ property_log, data = final_dataset)
+
+ggplot(final_dataset, aes(property_log, violent_log)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm") +
+  theme_minimal() +
+  labs(
+    title = "Violent and Property Crime Relationship",
+    x = "Number of Property Crime Incidents (Logarithmic Scale)",
+    y = "Number of Violent Crime Incidents (Logarithmic Scale)"
+  )
+
+cat("Plot 3 complete\n")
+
+```
+
+```{r combined_histogram, fig.width=14, fig.height=9}
+# =========================================================
+# 12. HISTOGRAM
+# =========================================================
+
+hist_df <- tibble(
+  property = log1p(final_dataset$property_count),
+  violent = log1p(final_dataset$violent_count)
+) %>%
+  pivot_longer(everything(), names_to = "type", values_to = "value") %>%
+  mutate(type = recode(type,
+                       property = "Property Crime",
+                       violent = "Violent Crime"))
+
+ggplot(hist_df, aes(value, fill = type)) +
+  geom_histogram(alpha = 0.4, bins = 35) +
+  theme_minimal() +
+  labs(title = "Crime Distribution (log1p)")
+
+cat("Plot 4 complete\n")
+
+```
+
+```{r combined_histogram, fig.width=14, fig.height=9}
+# ---------------------------------------------------------
+# LOG DISTRIBUTION HISTOGRAM (NA SAFE)
+# ---------------------------------------------------------
+
+hist_df <- tibble(
+  property_log = log1p(final_dataset$property_count),
+  violent_log = log1p(final_dataset$violent_count)
+) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "crime_type",
+    values_to = "log_count"
+  ) %>%
+  mutate(
+    crime_type = recode(
+      crime_type,
+      property_log = "Property Crime",
+      violent_log = "Violent Crime"
+    )
+  )
+
+# Compute means separately (cleaner + reusable)
+mean_lines <- hist_df %>%
+  group_by(crime_type) %>%
+  summarise(
+    mean_value = mean(log_count, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(hist_df, aes(x = log_count, fill = crime_type)) +
+  geom_histogram(
+    position = "identity",
+    alpha = 0.35,
+    bins = 35,
+    color = "white",
+    linewidth = 0.2
+  ) +
+  geom_vline(
+    data = mean_lines,
+    aes(xintercept = mean_value, color = crime_type),
+    linewidth = 1.3,
+    show.legend = FALSE
+  ) +
+  scale_fill_manual(values = crime_colors) +
+  scale_color_manual(values = c(
+    "Property Crime" = "darkblue",
+    "Violent Crime" = "darkred"
+  )) +
+  labs(
+    title = "Distribution of Property and Violent Crime Counts by County",
+    subtitle = "log1p transformation applied to reduce skew",
+    x = "Count of Crime Incidents (Log1p scale)",
+    y = "Frequency",
+    fill = "Crime Type"
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+cat("Plot 4 of 4 (Histogram) complete\n")
+cat("All visualizations finished successfully\n")
+
+```
